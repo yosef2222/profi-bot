@@ -1,0 +1,3 @@
+pyppeteer
+httpx
+python-dotenv
