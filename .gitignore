@@ -1,0 +1,8 @@
+.env
+session.json
+debug_*.png
+debug_*.html
+__pycache__/
+*.pyc
+.venv/
+puppeteer_env/

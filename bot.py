@@ -15,7 +15,7 @@ API_URL = f"https://{DOMAIN}/backoffice/api/"
 BOARD_URL = f"https://{DOMAIN}/backoffice/n.php"
 SESSION_FILE = "session.json"
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "baidu/cobuddy:free")
+AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 DEFAULT_PRICE_ENGLISH = int(os.getenv("DEFAULT_PRICE_ENGLISH", "1000"))
 DEFAULT_PRICE_ARABIC = int(os.getenv("DEFAULT_PRICE_ARABIC", "1500"))
@@ -70,7 +70,9 @@ def escape_js(s):
     return s.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
 
 
-def should_skip_local(text: str) -> tuple:
+def should_skip_local(text) -> tuple:
+    if not isinstance(text, str):
+        text = str(text or '')
     for pattern in KEEP_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             school_exam = [r"\bЕГЭ\b", r"\bОГЭ\b", r"школьная\s+программа",
@@ -116,25 +118,18 @@ ORDER: {order_text}"""
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             resp = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "http://localhost",
-                    "X-Title": "ProfiBot",
-                },
+                f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent?key={OPENROUTER_KEY}",
+                headers={"Content-Type": "application/json"},
                 json={
-                    "model": AI_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 300,
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300}
                 }
             )
             data = resp.json()
             if "error" in data:
                 print(f"    ⚠️  AI raw error: {data['error']}")
                 return {"apply": False, "category": None, "price": 0, "reason": "AI error"}
-            content = data["choices"][0]["message"]["content"]
+            content = data["candidates"][0]["content"]["parts"][0]["text"] or ""
             json_match = re.search(r'\{[\s\S]*\}', content)
             if json_match:
                 result = json.loads(json_match.group())
@@ -202,7 +197,7 @@ async def apply_to_order(page, order_id, price, message):
         clicked = 'coordinate'
 
     print(f"    ✅ Clicked: {clicked}")
-    await asyncio.sleep(4)
+    await asyncio.sleep(8)
 
     # Step 2: Fill textarea using React's native prototype setter
     filled = await page.evaluate('''(msg) => {
@@ -324,7 +319,7 @@ async def check_board(page, scan_num):
                 address = geo[loc]['address']
                 break
 
-        full_text = f"Title: {title}\nDescription: {desc}\nBudget: {budget}\nCommission: {commission}\nSchedule: {schedule}\nAddress: {address}"
+        full_text = f"Title: {title or ''}\nDescription: {desc or ''}\nBudget: {budget or ''}\nCommission: {str(commission) or ''}\nSchedule: {schedule or ''}\nAddress: {address or ''}"
         print(f"\n  🔍 [{order_id}] {title[:80]}")
 
         skip, reason = should_skip_local(full_text)
