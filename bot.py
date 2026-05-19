@@ -3,57 +3,34 @@ import json
 import os
 import re
 from datetime import datetime
-from playwright.async_api import async_playwright
-import httpx
+from pyppeteer import launch
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ===== CONFIG =====
 DOMAIN = os.getenv("PROFI_DOMAIN", "tomsk.profi.ru")
-API_URL = f"https://{DOMAIN}/backoffice/api/"
 BOARD_URL = f"https://{DOMAIN}/backoffice/n.php"
 SESSION_FILE = "session.json"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "gemini-2.0-flash-lite")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
-DEFAULT_PRICE_ENGLISH = int(os.getenv("DEFAULT_PRICE_ENGLISH", "1000"))
-DEFAULT_PRICE_ARABIC = int(os.getenv("DEFAULT_PRICE_ARABIC", "1500"))
+
+MIN_PRICE = int(os.getenv("MIN_PRICE", "800"))
+MAX_PRICE = int(os.getenv("MAX_PRICE", "2000"))
+DEFAULT_PRICE = int(os.getenv("DEFAULT_PRICE", "1200"))
+COMMISSION_MULTIPLIER = float(os.getenv("COMMISSION_MULTIPLIER", "3.0"))
 
 ARABIC_MESSAGE = os.getenv("ARABIC_MESSAGE", "")
 ENGLISH_MESSAGE = os.getenv("ENGLISH_MESSAGE", "")
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set in .env")
 if not ARABIC_MESSAGE or not ENGLISH_MESSAGE:
     raise ValueError("MESSAGE vars not set in .env")
 
 SKIP_PATTERNS = [
-    r"бартер", r"обмен(?!\s*опытом)", r"взамен", r"вместо оплаты",
-    r"перевод(чик)?\b(?!\s*язык)", r"письменный перевод",
-    r"разово", r"один раз", r"1 раз", r"одно занятие", r"1 занятие",
-    r"2 заняти", r"два заняти", r"на пару раз", r"несколько занятий",
-    r"ваканси", r"возможно.*ваканси", r"корпоративн",
-    r"приглашает.*сотрудничеств", r"приглашает.*преподавател",
-    r"сотрудничеств", r"в штат", r"ищем преподавател",
-    r"на постоянную работу", r"оформление по тк",
-    r"трудовой договор", r"резюме", r"CV",
-    r"онлайн[-\s]?школ", r"языковая\s+школа", r"образовательный\s+центр",
-    r"лингва\s+центр", r"учебный\s+центр",
-    r"подтянуть\s+(по\s+)?(школьной\s+)?программе",
-    r"школьная\s+программа",
-    r"помощь\s+с\s+(домашним|школьным)",
-    r"\bЕГЭ\b", r"\bОГЭ\b", r"подготовка\s+к\s+(ЕГЭ|ОГЭ|экзамен)",
-    r"государственный\s+экзамен", r"выпускной\s+экзамен",
-    r"не успеваете откликаться",
-]
-
-KEEP_PATTERNS = [
-    r"\b[1-6]\s*(курс|курса|курсу|курсе)\b",
-    r"(студент|студентка)\s+(вуза|университета|института|колледжа)",
-    r"университет", r"институт", r"академия",
-    r"взрослый", r"для\s+себя", r"для\s+работы", r"деловой\s+английский",
-    r"разговорный", r"для\s+путешествий", r"бизнес",
+    r"бартер",
+    r"обмен(?!\s*опытом)",
+    r"школ",
+    r"перевод(чик)?\b(?!\s*язык)",
+    r"ваканси",
 ]
 
 PROCESSED_ORDERS = set()
@@ -65,17 +42,9 @@ def escape_js(s):
     return s.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
 
 
-def should_skip_local(text) -> tuple:
+def should_skip(text) -> tuple:
     if not isinstance(text, str):
         text = str(text or '')
-    for pattern in KEEP_PATTERNS:
-        if re.search(pattern, text, re.IGNORECASE):
-            school_exam = [r"\bЕГЭ\b", r"\bОГЭ\b", r"школьная\s+программа",
-                           r"\b([1-8])\s*(класс|класса|классу|классе)\b"]
-            for sp in school_exam:
-                if re.search(sp, text, re.IGNORECASE):
-                    return True, f"School exam: '{sp}'"
-            return False, ""
     for pattern in SKIP_PATTERNS:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
@@ -83,55 +52,69 @@ def should_skip_local(text) -> tuple:
     return False, ""
 
 
-async def ask_ai(order_text: str) -> dict:
-    prompt = f"""Analyze this Profi.ru order. Respond ONLY with valid JSON:
-{{"apply": true/false, "category": "arabic"|"english"|null, "price": number, "reason": "brief Russian reason"}}
+def extract_commission(page_text):
+    """Extract commission — ONLY from 'Комиссия' keyword."""
+    m = re.search(r'[Кк]омисс[ия]+\s*:?\s*(\d+)\s*[₽р]', page_text)
+    if m:
+        return int(m.group(1))
+    return 0
 
-SKIP: вакансия, корпоративное, сотрудничество, резюме, бартер, перевод, разовое, онлайн-школа, ЕГЭ/ОГЭ, школьник 1-8 класс.
-KEEP: студент вуза, взрослый, для себя/работы, разговорный/деловой.
-Arabic → "arabic", English → "english".
-Price: {DEFAULT_PRICE_ENGLISH}-{DEFAULT_PRICE_ARABIC} RUB/hr. Never below 500.
 
-ORDER: {order_text}"""
+def extract_budget(page_text):
+    """Extract client budget."""
+    # Replace narrow non-breaking spaces with regular spaces
+    page_text = page_text.replace('\u202f', ' ').replace('\u00a0', ' ')
+    
+    # Range: "650–1100 ₽"
+    m = re.search(r'(\d+)\s*[–—-]\s*(\d+)\s*[₽р]', page_text)
+    if m:
+        return int(m.group(2))
+    
+    # "до 950 ₽" or "с 1000 ₽" or "от 800 ₽" or just "1500 ₽"
+    m = re.search(r'(?:до|с|от)?\s*(\d+)\s*[₽р]', page_text)
+    if m:
+        return int(m.group(1))
+    
+    return 0
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            resp = await client.post(url, headers={"Content-Type": "application/json"}, json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300}
-            })
-            data = resp.json()
-            if "error" in data:
-                print(f"\n    ⚠️  AI: {data['error'].get('message', str(data['error']))[:100]}")
-                return {"apply": False, "category": None, "price": 0, "reason": "AI error"}
-            text = data["candidates"][0]["content"]["parts"][0].get("text", "")
-            m = re.search(r'\{[\s\S]*\}', text)
-            if m:
-                r = json.loads(m.group())
-                r['reason'] = r.get('reason') or ''
-                return r
-            return {"apply": False, "category": None, "price": 0, "reason": "parse error"}
-    except Exception as e:
-        print(f"\n    ⚠️  AI exception: {str(e)[:80]}")
-        return {"apply": False, "category": None, "price": 0, "reason": str(e)}
 
+def calculate_price(budget_value, commission_value):
+    """Bid within client budget. If commission is very high, bid at top of budget."""
+    if not budget_value:
+        return DEFAULT_PRICE
+    
+    # If commission is more than 2x the budget (expensive order), bid at budget max
+    if commission_value > budget_value * 2:
+        return min(budget_value, MAX_PRICE)
+    
+    # Otherwise bid slightly under budget to be competitive
+    return max(budget_value - 200, MIN_PRICE)
+
+
+def determine_category(text):
+    """Determine if Arabic or English. Default to English."""
+    text_lower = text.lower()
+    # Arabic keywords
+    if any(w in text_lower for w in ['арабск', 'араб', 'arabic']):
+        return 'arabic'
+    # Everything else → English
+    return 'english'
 
 def setup_interception(page):
-    page.on('response', lambda resp: asyncio.ensure_future(_handle_response(resp)))
+    async def handle_response(response):
+        if 'graphql' not in response.url:
+            return
+        try:
+            data = await response.json()
+            items = data.get('data', {}).get('boSearchBoardItems', {}).get('items', [])
+            if items:
+                global _intercepted_items
+                _intercepted_items = items
+                _data_ready.set()
+        except Exception:
+            pass
 
-async def _handle_response(response):
-    if 'graphql' not in response.url:
-        return
-    try:
-        data = await response.json()
-        items = data.get('data', {}).get('boSearchBoardItems', {}).get('items', [])
-        if items:
-            global _intercepted_items
-            _intercepted_items = items
-            _data_ready.set()
-    except Exception:
-        pass
+    page.on('response', lambda resp: asyncio.ensure_future(handle_response(resp)))
 
 
 async def wait_for_board_data(timeout=20):
@@ -146,8 +129,25 @@ async def wait_for_board_data(timeout=20):
 async def apply_to_order(page, order_id, price, message):
     print(f"    🖱️  Opening order...")
     order_url = f"https://{DOMAIN}/backoffice/n.php?o={order_id}"
-    await page.goto(order_url, wait_until='domcontentloaded', timeout=60000)
-    await asyncio.sleep(6)
+    await page.goto(order_url, waitUntil='domcontentloaded', timeout=60000)
+    await asyncio.sleep(5)
+
+    # Get page text and extract commission + budget
+    page_text = await page.evaluate('() => document.body.innerText')
+    
+    # Check for vacancy on the page
+    if re.search(r'ваканси', page_text, re.IGNORECASE):
+        print(f"    ⏭️  SKIP: Vacancy detected on page")
+        return False
+    
+    commission = extract_commission(page_text)
+    budget_value = extract_budget(page_text)
+    
+    print(f"    💸 Commission: {commission}₽ | Budget: {budget_value}₽" if commission else f"    💸 Commission: ? | Budget: {budget_value}₽")
+    
+    # Recalculate price with actual data
+    price = calculate_price(budget_value, commission)
+    print(f"    💰 Final price: {price}₽ (3×{commission} = {commission * 3})")
 
     # Click "Продолжить"
     clicked = await page.evaluate('''() => {
@@ -164,10 +164,10 @@ async def apply_to_order(page, order_id, price, message):
         return null;
     }''')
     if not clicked:
-        print(f"    ⚠️  Продолжить not found, trying coordinate click...")
+        print(f"    ⚠️  Продолжить not found, coordinate click...")
         await page.mouse.click(600, 185)
     print(f"    ✅ Clicked continue")
-    await asyncio.sleep(8)
+    await asyncio.sleep(4)
 
     # Fill textarea
     filled = await page.evaluate('''(msg) => {
@@ -189,12 +189,13 @@ async def apply_to_order(page, order_id, price, message):
     await asyncio.sleep(1)
 
     # Fill price
-    for inp in await page.query_selector_all('input'):
+    for inp in await page.querySelectorAll('input'):
         try:
-            if await inp.is_visible():
+            visible = await page.evaluate('(el) => el.offsetParent !== null', inp)
+            if visible:
                 await inp.click({'clickCount': 3})
                 await inp.type(str(price))
-                print(f"    💰 Price: {price}₽")
+                print(f"    💰 Price typed: {price}₽")
                 break
         except:
             pass
@@ -214,11 +215,11 @@ async def apply_to_order(page, order_id, price, message):
         return null;
     }''')
     if not submitted:
-        # Fallback: click last visible button
-        btns = await page.query_selector_all('button')
+        btns = await page.querySelectorAll('button')
         for b in reversed(btns):
-            if await b.is_visible():
-                txt = await b.inner_text()
+            visible = await page.evaluate('(el) => el.offsetParent !== null', b)
+            if visible:
+                txt = await page.evaluate('(el) => el.innerText', b)
                 await b.click()
                 submitted = txt
                 break
@@ -237,7 +238,7 @@ async def check_board(page, scan_num):
     print(f"🔍 SCAN #{scan_num} | {datetime.now().strftime('%H:%M:%S')}")
     print(f"{'='*60}")
 
-    await page.goto(BOARD_URL, wait_until='domcontentloaded', timeout=30000)
+    await page.goto(BOARD_URL, waitUntil='domcontentloaded', timeout=30000)
     items = await wait_for_board_data(timeout=15)
 
     if not items:
@@ -259,38 +260,38 @@ async def check_board(page, scan_num):
         title = order.get('title', '')
         desc = order.get('description', '') or ''
         price_data = order.get('price', {}) or {}
-        budget = f"{price_data.get('value', '?')} {price_data.get('suffix', '₽')}" if price_data else "?"
+        budget = price_data.get('value', '') if price_data else ''
+        if budget:
+            # Clean: remove special spaces and ₽
+            budget_clean = str(budget).replace('\u202f', '').replace('\u00a0', '').replace('₽', '').strip()
+            budget_str = f"{budget_clean} ₽"
+        else:
+            budget_str = "?"
+            budget_clean = ""
+
         schedule = order.get('schedule', '') or ''
-        geo = order.get('geo', {}) or {}
-        address = ''
-        for loc in ['orderLocation', 'clientMayCome', 'remote']:
-            if geo.get(loc) and geo[loc].get('address'):
-                address = geo[loc]['address']
-                break
 
-        full_text = f"Title: {title or ''}\nDescription: {desc or ''}\nBudget: {budget or ''}\nSchedule: {schedule or ''}\nAddress: {address or ''}"
-        print(f"\n  🔍 [{order_id}] {title[:80]}")
+        full_text = f"{title} {desc} {schedule}"
+        print(f"\n  🔍 [{order_id}] {title[:80]} | Budget: {budget_str}")
 
-        skip, reason = should_skip_local(full_text)
+        skip, reason = should_skip(full_text)
         if skip:
-            print(f"    ⏭️  SKIP (local): {reason}")
+            print(f"    ⏭️  SKIP: {reason}")
             continue
 
-        print(f"    🤖 AI...", end=" ", flush=True)
-        ai = await ask_ai(full_text)
-        if ai.get('reason') in ('AI error', 'parse error') or not ai:
-            print(f"⚠️  AI failed, defaults")
-            is_arabic = 'араб' in full_text.lower()
-            ai = {"apply": True, "category": "arabic" if is_arabic else "english",
-                  "price": DEFAULT_PRICE_ARABIC if is_arabic else DEFAULT_PRICE_ENGLISH}
-        if not ai.get('apply', False):
-            print(f"⏭️  SKIP (AI): {ai.get('reason', '?')}")
-            continue
-
-        cat = ai.get('category', 'english')
-        price = ai.get('price', DEFAULT_PRICE_ENGLISH)
+        cat = determine_category(full_text)
         msg = ARABIC_MESSAGE if cat == 'arabic' else ENGLISH_MESSAGE
-        print(f"✅ {cat}, {price}₽/hr")
+        
+        # Initial price estimate (will be recalculated on order page)
+        budget_value = 0
+        if budget_clean:
+            # Handle ranges like "700–1300" or "700-1300"
+            numbers = re.findall(r'(\d+)', budget_clean)
+            if numbers:
+                budget_value = int(numbers[-1])  # Take the high end of the range
+
+        price = calculate_price(budget_value, 0)
+        print(f"    📝 {cat}, est. price: {price}₽/hr")
 
         if await apply_to_order(page, order_id, price, msg):
             applied += 1
@@ -301,65 +302,75 @@ async def check_board(page, scan_num):
 
 
 async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                  '--disable-gpu', '--single-process', '--no-zygote']
-        )
-        context = await browser.new_context(viewport={'width': 1280, 'height': 900}, locale='ru-RU')
-        page = await context.new_page()
+    browser = await launch(
+        headless=False,
+        executablePath='/usr/bin/chromium',
+        args=['--no-sandbox', '--disable-setuid-sandbox']
+    )
+    page = await browser.newPage()
+    await page.setViewport({'width': 1280, 'height': 900})
 
-        try:
-            with open(SESSION_FILE, 'r') as f:
-                saved = json.load(f)
-        except FileNotFoundError:
-            print(f"❌ {SESSION_FILE} not found.")
-            await browser.close()
-            return
+    try:
+        with open(SESSION_FILE, 'r') as f:
+            saved = json.load(f)
+    except FileNotFoundError:
+        print(f"❌ {SESSION_FILE} not found.")
+        await browser.close()
+        return
 
-        await context.add_cookies(saved['cookies'])
-        setup_interception(page)
+    # Clean cookies before setting — remove problematic fields
+    clean_cookies = []
+    for cookie in saved['cookies']:
+        clean = {
+            'name': cookie.get('name', ''),
+            'value': cookie.get('value', ''),
+            'domain': cookie.get('domain', ''),
+            'path': cookie.get('path', '/'),
+        }
+        # Only add optional fields if present and valid
+        if cookie.get('expires') and cookie['expires'] > 0:
+            clean['expires'] = cookie['expires']
+        if cookie.get('httpOnly'):
+            clean['httpOnly'] = cookie['httpOnly']
+        if cookie.get('secure'):
+            clean['secure'] = cookie['secure']
+        if cookie.get('sameSite') and cookie['sameSite'] in ('Strict', 'Lax', 'None'):
+            clean['sameSite'] = cookie['sameSite']
+        clean_cookies.append(clean)
+    
+    await page.setCookie(*clean_cookies)
+    setup_interception(page)
 
-        print("🔄 Loading Profi.ru...")
-        await page.goto(BOARD_URL, wait_until='domcontentloaded', timeout=60000)
-        await wait_for_board_data(timeout=15)
+    print("🔄 Loading Profi.ru...")
+    await page.goto(BOARD_URL, waitUntil='domcontentloaded', timeout=60000)
+    await wait_for_board_data(timeout=15)
 
-        if saved.get('localStorage'):
-            for k, v in saved['localStorage'].items():
-                await page.evaluate(f'localStorage.setItem("{escape_js(str(k))}", "{escape_js(str(v))}");')
+    if saved.get('localStorage'):
+        for k, v in saved['localStorage'].items():
+            await page.evaluate(f'localStorage.setItem("{escape_js(str(k))}", "{escape_js(str(v))}");')
 
-        print(f"✅ Bot ready — Ctrl+C to stop\n")
+    # Verify login
+    profile_text = await page.evaluate('() => document.body.innerText')
+    if 'Вход' in profile_text or 'Авторизация' in profile_text:
+        print(f"❌ Session expired. Please re-run save_session.py")
+        await browser.close()
+        return
 
-        scan_num = 0
-        total_applied = 0
+    print(f"✅ Bot ready — Ctrl+C to stop\n")
+    # ... rest of main
 
-        try:
-            while True:
-                scan_num += 1
-                applied = await check_board(page, scan_num)
-                total_applied += applied
-                if applied > 0:
-                    print(f"\n  📊 Total applied: {total_applied}")
+    scan_num = 0
+    total_applied = 0
 
-                cookies = await context.cookies()
-                ls = await page.evaluate('''() => {
-                    let items = {};
-                    for (let i = 0; i < localStorage.length; i++) {
-                        let k = localStorage.key(i); items[k] = localStorage.getItem(k);
-                    }
-                    return items;
-                }''')
-                with open(SESSION_FILE, 'w') as f:
-                    json.dump({'cookies': cookies, 'localStorage': ls}, f, indent=2)
+    try:
+        while True:
+            scan_num += 1
+            applied = await check_board(page, scan_num)
+            total_applied += applied
+            if applied > 0:
+                print(f"\n  📊 Total applied: {total_applied}")
 
-                print(f"  ⏳ Next check in {CHECK_INTERVAL}s...")
-                await asyncio.sleep(CHECK_INTERVAL)
-
-        except KeyboardInterrupt:
-            print(f"\n\n🛑 Stopped. Total applied: {total_applied}")
-        finally:
-            cookies = await context.cookies()
+            cookies = await page.cookies()
             ls = await page.evaluate('''() => {
                 let items = {};
                 for (let i = 0; i < localStorage.length; i++) {
@@ -369,8 +380,25 @@ async def main():
             }''')
             with open(SESSION_FILE, 'w') as f:
                 json.dump({'cookies': cookies, 'localStorage': ls}, f, indent=2)
-            print("✅ Session saved.")
-            await browser.close()
+
+            print(f"  ⏳ Next check in {CHECK_INTERVAL}s...")
+            await asyncio.sleep(CHECK_INTERVAL)
+
+    except KeyboardInterrupt:
+        print(f"\n\n🛑 Stopped. Total applied: {total_applied}")
+    finally:
+        cookies = await page.cookies()
+        ls = await page.evaluate('''() => {
+            let items = {};
+            for (let i = 0; i < localStorage.length; i++) {
+                let k = localStorage.key(i); items[k] = localStorage.getItem(k);
+            }
+            return items;
+        }''')
+        with open(SESSION_FILE, 'w') as f:
+            json.dump({'cookies': cookies, 'localStorage': ls}, f, indent=2)
+        print("✅ Session saved.")
+        await browser.close()
 
 
 asyncio.run(main())
